@@ -20,6 +20,10 @@ class SimpleSplitTerminal:
         self.hex_history = deque(maxlen=100) # Tracks typed character hex codes
         self.current_input = ""
         self.connected = False
+
+        self.rx_pos = 0
+
+        self.split = "vertical"
         
         # Setup colors and screen
         curses.use_default_colors()
@@ -36,6 +40,7 @@ class SimpleSplitTerminal:
         self.sidebar_width = 8
         self.main_width = self.width - self.sidebar_width - 1
         self.split_row = self.height // 2
+        self.split_col = self.main_width // 2
         
         # Sub-window bounds checking to prevent crashes on tiny screens
         if self.height < 10 or self.width < 30:
@@ -45,17 +50,30 @@ class SimpleSplitTerminal:
         self.stdscr.clear()
         
         # Create windows: newwin(height, width, begin_y, begin_x)
-        self.rx_win = curses.newwin(self.split_row, self.main_width, 0, 0)
-        self.tx_win = curses.newwin(self.height - self.split_row - 1, self.main_width, self.split_row + 1, 0)
+        if self.split == "vertical":
+            self.rx_win = curses.newwin(self.height, self.split_col, 0, 0)
+            self.tx_win = curses.newwin(self.height, self.main_width - self.split_col - 1, 0, self.split_col + 1)
+        else:
+            self.rx_win = curses.newwin(self.split_row, self.main_width, 0, 0)
+            self.tx_win = curses.newwin(self.height - self.split_row - 1, self.main_width, self.split_row + 1, 0)
+
+
+
         self.hex_win = curses.newwin(self.height, self.sidebar_width, 0, self.main_width + 1)
         
         # Enable scrolling for output windows
-        self.rx_win.scrollok(True)
+        # self.rx_win.scrollok(True)
         
     def draw_borders(self):
-        # Draw horizontal split line
+        
         try:
-            self.stdscr.hline(self.split_row, 0, curses.ACS_HLINE, self.main_width)
+            if self.split == "vertical":
+                # Draw vertical split line
+                self.stdscr.vline(0, self.split_col, curses.ACS_VLINE, self.height)
+            else:
+                # Draw horizontal split line
+                self.stdscr.hline(self.split_row, 0, curses.ACS_HLINE, self.main_width)
+
             # Draw vertical sidebar line
             self.stdscr.vline(0, self.main_width, curses.ACS_VLINE, self.height)
             # Intersection joint
@@ -78,10 +96,8 @@ class SimpleSplitTerminal:
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         formatted_line = f"[{timestamp}] {text}"
         self.rx_lines.append(formatted_line)
-        
-        # Write to window & scroll
-        self.rx_win.addstr(formatted_line + "\n")
-        self.rx_win.refresh()
+
+        self.update_rx_display()
 
     def add_tx_line(self, text):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -91,6 +107,17 @@ class SimpleSplitTerminal:
         # Write to window & scroll
         self.tx_win.addstr(formatted_line + "\n")
         self.tx_win.refresh()
+
+    def update_rx_display(self):
+        self.rx_win.clear()
+        max_rx_h, max_rx_w = self.rx_win.getmaxyx()
+
+        line_count = len(self.rx_lines)
+
+        for i in self.rx_lines[line_count - max_rx_h + 1-self.rx_pos:line_count-self.rx_pos]:
+            self.rx_win.addstr(i + "\n")
+
+        self.rx_win.refresh()
 
     def update_tx_display(self):
         self.tx_win.clear()
@@ -155,6 +182,39 @@ class SimpleSplitTerminal:
                 self.update_tx_display()
                 self.update_hex_sidebar()
                 continue
+
+            if ch == curses.KEY_UP:
+                self.rx_pos += 1
+                self.stdscr.addstr(2, 0, f"Scrolling up. Position: {self.rx_pos}")
+                self.stdscr.refresh()
+                self.update_rx_display()
+
+            if ch == curses.KEY_DOWN:
+                self.rx_pos -= 1
+                if self.rx_pos < 0:
+                    self.rx_pos = 0
+
+                self.update_rx_display()
+
+            if ch == curses.KEY_MOUSE:
+                try:
+                    # 3. Retrieve the mouse event tuple
+                    # _, x, y, _, bstate = curses.getmouse()
+                    mouse_id, x, y, z, bstate = curses.getmouse()
+                    
+                    # 4. Check bitmasks for scroll up/down
+                    # Note: Exact button states can vary slightly by terminal emulator
+                    if bstate & curses.BUTTON4_PRESSED:
+                        self.rx_win.scrl(1)
+                    elif bstate & curses.BUTTON5_PRESSED: # Often button 5 or 4-shifted
+                        self.rx_win.scrl(-1)
+                    else:
+                        # Catch-all for other terminal-specific scroll masks
+                        self.stdscr.addstr(2, 0, f"Mouse action detected. Mask: {hex(bstate)}")
+                        
+                    self.stdscr.refresh()
+                except curses.error:
+                    pass
                 
             if ch != -1:
                 # Check for exit (Ctrl+C or ESC)
@@ -192,6 +252,10 @@ class SimpleSplitTerminal:
                     
                     self.update_tx_display()
                     self.update_hex_sidebar()
+                else:
+                    # self.stdscr.addstr(2, 0, f"Unhandled key: {ch}")
+                    # self.stdscr.refresh()
+                    pass
 
 def find_serial_ports():
     # Search patterns for USB and ARM/AMBA serial ports in /dev

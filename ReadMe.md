@@ -3,7 +3,7 @@ A very simple terminal that splits the screen in the TX and RX so it is easy to 
 
 Calling without arguments will list all USB and AT ports
 
-Most Made with AI Tools
+Mostly Made with AI Tools
 
 ### Arguments
 - port Ex: /dev/ttyUSB0
