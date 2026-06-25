@@ -7,6 +7,29 @@ from collections import deque
 import glob
 import serial
 
+def text_length(text):
+    l = len(text)
+    for i in range(len(text)):
+        if not text[i].isprintable() and text[i] != '\n':
+            l += 2 # Werid characters take up more space
+    return l
+
+def add_user_text(win, text):
+    new_text = ""
+    for i in range(len(text)):
+        char = text[i]
+        if char.isprintable() or char == '\n':
+            new_text += char
+        else:
+            win.addstr(new_text)
+            new_text = ""
+            win.addstr(f"\\x{ord(char):02x}", curses.color_pair(4))
+
+    if len(new_text) > 0:
+        win.addstr(new_text)
+
+    return new_text
+
 class SimpleSplitTerminal:
     def __init__(self, stdscr, port, baudrate):
         self.stdscr = stdscr
@@ -22,6 +45,7 @@ class SimpleSplitTerminal:
         self.connected = False
 
         self.rx_pos = 0
+        self.tx_pos = 0
 
         self.split = "vertical"
         
@@ -29,7 +53,13 @@ class SimpleSplitTerminal:
         curses.use_default_colors()
         curses.curs_set(1) # Show cursor
         self.stdscr.timeout(20) # Non-blocking input delay (ms)
-        
+
+        curses.start_color()
+        curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLACK)  # Normal text
+        curses.init_pair(2, curses.COLOR_CYAN, curses.COLOR_BLACK)   # Prompt
+        curses.init_pair(3, curses.COLOR_GREEN, curses.COLOR_BLACK)  # Success
+        curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)    # Error
+
         # Init layout dimensions
         self.resize_windows()
 
@@ -57,30 +87,25 @@ class SimpleSplitTerminal:
             self.rx_win = curses.newwin(self.split_row, self.main_width, 0, 0)
             self.tx_win = curses.newwin(self.height - self.split_row - 1, self.main_width, self.split_row + 1, 0)
 
+        max_history_lines = 1000
 
+        # --- Create the Pads ---
+        
+        # For the RX (Receive) Pad:
+        # It needs to be wide enough to fit inside the rx_win border (width - 2)
+        rx_max_y, rx_max_x = self.rx_win.getmaxyx()
+        self.rx_pad = curses.newpad(max_history_lines, rx_max_x - 2)
+
+        # For the TX (Transmit) Pad:
+        # It needs to be wide enough to fit inside the tx_win border (width - 2)
+        tx_max_y, tx_max_x = self.tx_win.getmaxyx()
+        self.tx_pad = curses.newpad(max_history_lines, tx_max_x - 2)
 
         self.hex_win = curses.newwin(self.height, self.sidebar_width, 0, self.main_width + 1)
         
-        # Enable scrolling for output windows
-        # self.rx_win.scrollok(True)
-        
-    def draw_borders(self):
-        
-        try:
-            if self.split == "vertical":
-                # Draw vertical split line
-                self.stdscr.vline(0, self.split_col, curses.ACS_VLINE, self.height)
-            else:
-                # Draw horizontal split line
-                self.stdscr.hline(self.split_row, 0, curses.ACS_HLINE, self.main_width)
-
-            # Draw vertical sidebar line
-            self.stdscr.vline(0, self.main_width, curses.ACS_VLINE, self.height)
-            # Intersection joint
-            self.stdscr.addch(self.split_row, self.main_width, curses.ACS_PLUS)
-            self.stdscr.refresh()
-        except curses.error:
-            pass
+        self.update_hex_sidebar()
+        self.update_tx_display()
+        self.update_rx_display()
 
     def connect_serial(self):
         while not self.connected:
@@ -95,29 +120,18 @@ class SimpleSplitTerminal:
     def add_rx_line(self, text):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         formatted_line = f"[{timestamp}] {text}"
-        self.rx_lines.append(formatted_line)
+        
+        add_user_text(self.rx_pad, formatted_line + "\n")
 
         self.update_rx_display()
 
     def add_tx_line(self, text):
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         formatted_line = f"[{timestamp}] {text}"
-        self.tx_lines.append(formatted_line)
         
-        # Write to window & scroll
-        self.tx_win.addstr(formatted_line + "\n")
-        self.tx_win.refresh()
+        add_user_text(self.tx_pad, formatted_line + "\n")
 
-    def update_rx_display(self):
-        self.rx_win.clear()
-        max_rx_h, max_rx_w = self.rx_win.getmaxyx()
-
-        line_count = len(self.rx_lines)
-
-        for i in self.rx_lines[line_count - max_rx_h + 1-self.rx_pos:line_count-self.rx_pos]:
-            self.rx_win.addstr(i + "\n")
-
-        self.rx_win.refresh()
+        self.update_tx_display()
 
     def update_tx_display(self):
         self.tx_win.clear()
@@ -125,16 +139,70 @@ class SimpleSplitTerminal:
         
         # Display Prompt
         prompt = "TX > "
-        self.tx_win.addstr(0, 0, prompt, curses.A_BOLD)
+        
         
         # Display typed text (truncated if it exceeds window width)
         available_width = max_tx_w - len(prompt) - 1
         visible_input = self.current_input[-available_width:]
-        self.tx_win.addstr(0, len(prompt), visible_input)
+        
+
+        # 1. Clear and draw borders on the container windows
+        self.tx_win.erase()
+        self.tx_win.box()
+        self.tx_win.addstr(0, 2, " TX Buffer ", curses.A_BOLD)
+        self.tx_win.addstr(1, 1, prompt, curses.A_BOLD)
+        self.tx_win.addstr(1, len(prompt)+1, visible_input)
+
+        # 2. Stage the window refreshes in memory
+        self.tx_win.noutrefresh()
+
+        # 3. Calculate absolute screen coordinates for the PAD inner viewports
+        # RX inner boundaries
+        tx_beg_y, tx_beg_x = self.tx_win.getbegyx()
+        tx_max_y, tx_max_x = self.tx_win.getmaxyx()
+
+        # 4. Stage the pad updates over the window interiors
+        # Arguments: pad, pad_top_line, pad_left_col, screen_top_y, screen_left_x, screen_bottom_y, screen_right_x
+        self.tx_pad.noutrefresh(
+            self.tx_pos, 0,
+            tx_beg_y + 2, tx_beg_x + 1,        # Top-left interior
+            tx_beg_y + tx_max_y - 2, tx_beg_x + tx_max_x - 2 # Bottom-right interior
+        )
+
+        # 5. Push everything to the physical screen simultaneously
+        curses.doupdate()
         
         # Move cursor to end of text
         self.tx_win.move(0, len(prompt) + len(visible_input))
-        self.tx_win.refresh()
+        
+
+
+    def update_rx_display(self):
+        # 1. Clear and draw borders on the container windows
+        self.rx_win.erase()
+        self.rx_win.box()
+        self.rx_win.addstr(0, 2, " RX Buffer ", curses.A_BOLD)
+
+        # 2. Stage the window refreshes in memory
+        self.rx_win.noutrefresh()
+
+        # 3. Calculate absolute screen coordinates for the PAD inner viewports
+        # RX inner boundaries
+        rx_beg_y, rx_beg_x = self.rx_win.getbegyx()
+        rx_max_y, rx_max_x = self.rx_win.getmaxyx()
+
+        current_y, current_x = self.rx_pad.getyx()
+
+        # 4. Stage the pad updates over the window interiors
+        # Arguments: pad, pad_top_line, pad_left_col, screen_top_y, screen_left_x, screen_bottom_y, screen_right_x
+        self.rx_pad.noutrefresh(
+            max(0, current_y - (rx_max_y - self.rx_pos)), 0,
+            rx_beg_y + 1, rx_beg_x + 1,        # Top-left interior
+            rx_beg_y + rx_max_y - 2, rx_beg_x + rx_max_x - 2 # Bottom-right interior
+        )
+
+        # 5. Push everything to the physical screen simultaneously
+        curses.doupdate()
 
     def update_hex_sidebar(self):
         self.hex_win.clear()
@@ -153,8 +221,8 @@ class SimpleSplitTerminal:
 
     def run(self):
         self.connect_serial()
-        self.draw_borders()
         self.update_tx_display()
+        self.update_rx_display()
         self.update_hex_sidebar()
         
         rx_buffer = bytearray()
@@ -174,20 +242,25 @@ class SimpleSplitTerminal:
                     self.add_rx_line(f"SERIAL ERROR: {e}")
 
             # 2. Handle Key Input (Tx)
-            ch = self.stdscr.getch()
-            
+            try:
+                ch = self.stdscr.getch()
+            except KeyboardInterrupt:
+                break
+            except curses.error:
+                continue
+
             if ch == curses.KEY_RESIZE:
                 self.resize_windows()
-                self.draw_borders()
-                self.update_tx_display()
-                self.update_hex_sidebar()
+                
                 continue
 
             if ch == curses.KEY_UP:
                 self.rx_pos += 1
+                
+                
+                self.update_rx_display()
                 self.stdscr.addstr(2, 0, f"Scrolling up. Position: {self.rx_pos}")
                 self.stdscr.refresh()
-                self.update_rx_display()
 
             if ch == curses.KEY_DOWN:
                 self.rx_pos -= 1
@@ -195,26 +268,6 @@ class SimpleSplitTerminal:
                     self.rx_pos = 0
 
                 self.update_rx_display()
-
-            if ch == curses.KEY_MOUSE:
-                try:
-                    # 3. Retrieve the mouse event tuple
-                    # _, x, y, _, bstate = curses.getmouse()
-                    mouse_id, x, y, z, bstate = curses.getmouse()
-                    
-                    # 4. Check bitmasks for scroll up/down
-                    # Note: Exact button states can vary slightly by terminal emulator
-                    if bstate & curses.BUTTON4_PRESSED:
-                        self.rx_win.scrl(1)
-                    elif bstate & curses.BUTTON5_PRESSED: # Often button 5 or 4-shifted
-                        self.rx_win.scrl(-1)
-                    else:
-                        # Catch-all for other terminal-specific scroll masks
-                        self.stdscr.addstr(2, 0, f"Mouse action detected. Mask: {hex(bstate)}")
-                        
-                    self.stdscr.refresh()
-                except curses.error:
-                    pass
                 
             if ch != -1:
                 # Check for exit (Ctrl+C or ESC)
